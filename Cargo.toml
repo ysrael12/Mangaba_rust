@@ -2,6 +2,23 @@
 name = "mangaba"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
+authors = ["Ysrael SacraS"]
+description = "A modular, provider-agnostic LLM agent framework in Rust (ReAct, RAG, multi-agent crews, A2A/MCP)."
+license = "MIT"
+repository = "https://github.com/ysrael12/Mangaba_rust"
+homepage = "https://github.com/ysrael12/Mangaba_rust"
+documentation = "https://docs.rs/mangaba"
+readme = "README.md"
+keywords = ["llm", "agent", "ai", "rag", "tokio"]
+categories = ["api-bindings", "asynchronous"]
+# Keep the published .crate tarball lean — ship only what the library needs.
+exclude = [
+    ".env",
+    ".env.*",
+    "target/",
+    "*.log",
+]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -55,6 +55,11 @@ async fn test_file_reader_not_found() {
 #[tokio::test]
 async fn test_directory_list() {
     let tool = DirectoryListTool;
-    let result = tool.call(json!({"directory_path": "/tmp"})).await.unwrap();
+    // Use the platform temp dir so the test works on Windows (no `/tmp`) too.
+    let dir = std::env::temp_dir();
+    let result = tool
+        .call(json!({"directory_path": dir.to_str().unwrap()}))
+        .await
+        .unwrap();
     assert!(result.success);
 }

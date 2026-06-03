@@ -63,9 +63,30 @@ EventBus::emit(Event::new(
 
 ### Limpeza de Listeners
 
-O `EventBus` é global e listeners acumulam entre execuções. Em testes,
-é importante considerar que listeners de testes anteriores podem
-ainda estar registrados.
+O `EventBus` é global e listeners acumulam entre execuções. Use
+`EventBus::clear()` para removê-los — útil sobretudo para isolar testes, já que
+o barramento é um singleton de processo:
+
+```rust
+EventBus::clear(); // remove todos os listeners registrados
+```
+
+### Garantias de Segurança
+
+O `emit` foi projetado para nunca derrubar o framework por causa de um listener:
+
+- **Reentrância segura**: os handles dos listeners são clonados para fora do
+  lock global *antes* de serem invocados, então um listener pode chamar
+  `emit`/`subscribe` novamente sem deadlock.
+- **À prova de panic/poison**: se um listener entrar em panic, o `Mutex` interno
+  é recuperado via `into_inner()` — `emit`/`subscribe` continuam funcionando em
+  vez de propagarem o poison.
+- **Não bloqueia outros emissores**: como o lock é liberado antes de executar os
+  listeners, um listener lento não bloqueia quem está emitindo em paralelo.
+
+> Atenção: os listeners ainda rodam **de forma síncrona** na thread que chamou
+> `emit`. Para trabalho pesado ou I/O bloqueante dentro de um listener, despache
+> para uma task (`tokio::spawn`) e evite bloquear a worker thread do executor.
 
 ## Callbacks
 
@@ -132,7 +153,7 @@ Os callbacks são disparados durante:
 |---------|----------|-----------|
 | **Escopo** | Global | Local (por instância) |
 | **Comunicação** | Desacoplada | Direta |
-| **Tipo** | Assíncrono (sem retorno) | Síncrono (sem retorno) |
+| **Tipo** | Síncrono, reentrante-seguro (sem retorno) | Síncrono (sem retorno) |
 | **Filtro** | Por tipo de evento | Por ponto do ciclo |
 | **Uso principal** | Logging, monitoria, métricas | Debug, hooks de UI |
 

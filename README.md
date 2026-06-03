@@ -39,16 +39,19 @@ mangaba::core
 ## Quick Start
 
 ```rust
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use mangaba::core::config::Config;
-use mangaba::core::llm::create_llm;
+use mangaba::core::llm::create_llm_client;
 use mangaba::core::agent::Agent;
 use mangaba::core::task::Task;
 use mangaba::core::crew::Crew;
+use mangaba::core::types::{AgentConfig, TaskConfig, ProcessType};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::load()?;
-    let llm = create_llm(&cfg.to_llm_config())?;
+    let llm = create_llm_client(&cfg.to_llm_config())?;
 
     let agent = Agent::new(
         AgentConfig {
@@ -106,7 +109,10 @@ File/Text → DocumentChunker → Embed → LocalChroma (SQLite) → Query
 - **MCP**: model context protocol with priority scoring and relevance filtering
 
 ### Streaming
-`LLMClient::stream_chat()` returns `Pin<Box<dyn Stream<Item = Result<String>>>>`. Providers default to wrapping `chat()`; OpenAI/OpenRouter implement real SSE.
+`LLMClient::stream_chat()` returns `Pin<Box<dyn Stream<Item = Result<String>>>>`. Providers default to wrapping `chat()`; OpenAI/OpenRouter implement real SSE with a **cross-chunk buffer** so events split across TCP packets are never dropped.
+
+### Resilience
+Network/HTTP failures are mapped onto the typed `MangabaError` taxonomy at the source (`429 → RateLimit` honoring `Retry-After`, `401/403 → Authentication`, malformed bodies → `LLM`). `with_retry` then retries only what is genuinely transient and **fails fast on fatal errors**. The global `EventBus` is reentrant- and panic-safe. Agents propagate the underlying cause instead of masking it.
 
 ## Configuration
 
@@ -124,7 +130,7 @@ Or use `Config::load()` / `create_llm_config()` programmatically.
 ## Testing
 
 ```bash
-cargo test          # 49+ tests
+cargo test          # 63 tests (lib unit + integration)
 cargo doc --no-deps # generate docs
 ```
 

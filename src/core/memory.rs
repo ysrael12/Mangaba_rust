@@ -119,10 +119,11 @@ impl LongTermMemory {
         serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    fn save(&self) {
+    /// Persist to disk without blocking the async executor thread.
+    async fn save(&self) {
         if let Some(ref path) = self.storage_path {
             if let Ok(data) = serde_json::to_string(&self.items) {
-                let _ = std::fs::write(path, &data);
+                let _ = tokio::fs::write(path, &data).await;
             }
         }
     }
@@ -133,7 +134,7 @@ impl BaseMemory for LongTermMemory {
     async fn add(&mut self, entry: &str, metadata: Option<serde_json::Value>) {
         if self.items.len() >= self.max_items { self.items.remove(0); }
         self.items.push(LTEntry { text: entry.to_string(), metadata });
-        self.save();
+        self.save().await;
         emit_add("long_term", entry);
     }
 

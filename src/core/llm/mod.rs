@@ -15,17 +15,17 @@
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use futures::Stream;
-use reqwest::Client;
+use futures::{Stream, StreamExt};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::StreamExt;
 
 use crate::core::types::{
     LLMConfig, OpenRouterConfig, LLMResponse, FinishReason,
     Message, Role, ToolCall, TokenUsage,
 };
+use crate::core::errors::MangabaError;
 use crate::core::tools::BaseTool;
 use crate::core::events::{EventBus, Event, EventType};
 use crate::core::retry::{RetryConfig, with_retry};
@@ -75,6 +75,57 @@ impl LLMClient for DummyLLM {
 }
 
 // ===========================================================================
+// HTTP helper — centralizes status classification + error-payload detection
+// ===========================================================================
+/// Send a request and parse the JSON body, mapping transport/HTTP failures onto
+/// the [`MangabaError`] taxonomy so that [`with_retry`] can decide whether a
+/// retry is worthwhile:
+/// - `429` → [`MangabaError::RateLimit`] (honors `Retry-After`) — retryable,
+/// - `401`/`403` → [`MangabaError::Authentication`] — NOT retryable,
+/// - any other 4xx/5xx → [`MangabaError::LLM`],
+/// - a `200` body that still carries an `"error"` object → [`MangabaError::LLM`].
+async fn send_and_parse(req: RequestBuilder) -> Result<Value> {
+    let resp = req.send().await?;
+    let status = resp.status();
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2);
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(MangabaError::RateLimit { retry_after, detail }.into());
+    }
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(MangabaError::Authentication(detail).into());
+    }
+    if status.is_server_error() {
+        // 5xx (500/502/503/504, ...) are transient server-side failures. We
+        // deliberately return an *untyped* error so `with_retry::classify`
+        // treats it as retryable — a non-retryable MangabaError would make the
+        // agent give up on a momentary "high demand" blip.
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status} (transient): {detail}"));
+    }
+    if !status.is_success() {
+        // Other 4xx are client errors (bad request, etc.) — retrying the same
+        // payload won't help, so surface a fatal, typed error.
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(MangabaError::LLM(format!("HTTP {status}: {detail}")).into());
+    }
+
+    let body: Value = resp.json().await?;
+    // Most providers signal logical errors via an `"error"` object even on 200.
+    if let Some(err) = body.get("error").filter(|e| !e.is_null()) {
+        return Err(MangabaError::LLM(err.to_string()).into());
+    }
+    Ok(body)
+}
+
+// ===========================================================================
 // OpenAI-format macro
 // ===========================================================================
 macro_rules! openai_chat_impl {
@@ -90,14 +141,9 @@ macro_rules! openai_chat_impl {
                 if !tools.is_empty() {
                     payload["tools"] = tools_to_openai(tools);
                 }
-                let resp = self.http
-                    .post(&url)
-                    .bearer_auth(&self.api_key)
-                    .json(&payload)
-                    .send()
-                    .await?
-                    .json::<Value>()
-                    .await?;
+                let resp = send_and_parse(
+                    self.http.post(&url).bearer_auth(&self.api_key).json(&payload)
+                ).await?;
                 parse_openai_response(resp, &self.model)
             }
 
@@ -108,41 +154,64 @@ macro_rules! openai_chat_impl {
                     "messages": messages_to_openai(messages),
                     "stream": true,
                 });
-                let stream = self.http
+                let byte_stream = self.http
                     .post(&url)
                     .bearer_auth(&self.api_key)
                     .json(&payload)
                     .send()
                     .await?
-                    .bytes_stream()
-                    .map(|chunk| {
-                        chunk
-                            .map_err(|e| anyhow!("Stream error: {e}"))
-                            .and_then(|b| parse_sse_chunk(&String::from_utf8_lossy(&b)))
-                    });
-                Ok(Box::pin(stream))
+                    .bytes_stream();
+                Ok(Box::pin(openai_sse_stream(byte_stream)))
             }
         }
     };
 }
 
-fn parse_sse_chunk(text: &str) -> Result<String> {
-    for line in text.lines() {
+/// Wrap a raw byte stream into a token stream, **buffering across chunks** so
+/// that an SSE event split over multiple TCP packets is never dropped.
+/// Events are delimited by a blank line (`\n\n`) per the SSE spec.
+fn openai_sse_stream<S, B>(byte_stream: S) -> impl Stream<Item = Result<String>> + Send
+where
+    S: Stream<Item = reqwest::Result<B>> + Send + 'static,
+    B: AsRef<[u8]>,
+{
+    byte_stream.scan(String::new(), |buf, chunk| {
+        let result = match chunk {
+            Ok(bytes) => {
+                buf.push_str(&String::from_utf8_lossy(bytes.as_ref()));
+                let mut emitted = String::new();
+                while let Some(idx) = buf.find("\n\n") {
+                    let block: String = buf.drain(..idx + 2).collect();
+                    if let Some(tok) = parse_sse_event(&block) {
+                        emitted.push_str(&tok);
+                    }
+                }
+                Ok(emitted)
+            }
+            Err(e) => Err(anyhow!("Stream error: {e}")),
+        };
+        futures::future::ready(Some(result))
+    })
+}
+
+/// Parse one *complete* SSE event block, concatenating all `delta.content`
+/// fragments it contains. Returns `None` if the block yields no text.
+fn parse_sse_event(block: &str) -> Option<String> {
+    let mut out = String::new();
+    for line in block.lines() {
         let line = line.trim();
-        if line.is_empty() || line == "data: [DONE]" {
-            continue;
-        }
         if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                continue;
+            }
             if let Ok(val) = serde_json::from_str::<Value>(data) {
                 if let Some(delta) = val["choices"][0]["delta"]["content"].as_str() {
-                    if !delta.is_empty() {
-                        return Ok(delta.to_string());
-                    }
+                    out.push_str(delta);
                 }
             }
         }
     }
-    Ok(String::new())
+    if out.is_empty() { None } else { Some(out) }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,9 +321,12 @@ impl LLMClient for OpenRouterClient {
         if !tools.is_empty() {
             payload["tools"] = tools_to_openai(tools);
         }
-        let mut req = self.http.post(&url).bearer_auth(&self.api_key).json(&payload);
-        req = req.header("HTTP-Referer", &self.site_url);
-        let resp = req.send().await?.json::<Value>().await?;
+        let req = self.http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&payload)
+            .header("HTTP-Referer", &self.site_url);
+        let resp = send_and_parse(req).await?;
         parse_openai_response(resp, &self.model)
     }
 
@@ -265,18 +337,15 @@ impl LLMClient for OpenRouterClient {
             "messages": messages_to_openai(messages),
             "stream": true,
         });
-        let stream = self.http
+        let byte_stream = self.http
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&payload)
+            .header("HTTP-Referer", &self.site_url)
             .send()
             .await?
-            .bytes_stream()
-            .map(|chunk| chunk
-                .map_err(|e| anyhow!("Stream error: {e}"))
-                .and_then(|b| parse_sse_chunk(&String::from_utf8_lossy(&b)))
-            );
-        Ok(Box::pin(stream))
+            .bytes_stream();
+        Ok(Box::pin(openai_sse_stream(byte_stream)))
     }
 }
 
@@ -312,7 +381,7 @@ impl LLMClient for GoogleClient {
         if !tools.is_empty() {
             payload["tools"] = tools_to_google(tools);
         }
-        let resp = self.http.post(&url).json(&payload).send().await?.json::<Value>().await?;
+        let resp = send_and_parse(self.http.post(&url).json(&payload)).await?;
         parse_google_response(resp, &self.model)
     }
 }
@@ -352,15 +421,13 @@ impl LLMClient for ClaudeClient {
         if !tools.is_empty() {
             payload["tools"] = tools_to_claude(tools);
         }
-        let resp = self.http
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&payload)
-            .send()
-            .await?
-            .json::<Value>()
-            .await?;
+        let resp = send_and_parse(
+            self.http
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&payload)
+        ).await?;
         parse_claude_response(resp, &self.model)
     }
 }
@@ -392,14 +459,9 @@ impl LLMClient for HuggingFaceClient {
         let url = format!("{}/{}", self.base_url, self.model);
         let prompt = build_hf_prompt(messages, tools);
         let payload = json!({ "inputs": prompt, "parameters": json!({ "return_full_text": false }) });
-        let resp = self.http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await?
-            .json::<Value>()
-            .await?;
+        let resp = send_and_parse(
+            self.http.post(&url).bearer_auth(&self.api_key).json(&payload)
+        ).await?;
         parse_hf_response(resp, &self.model)
     }
 }
@@ -533,6 +595,11 @@ fn messages_to_openai(messages: &[Message]) -> Vec<Value> {
 }
 
 fn parse_openai_response(resp: Value, model: &str) -> Result<LLMResponse> {
+    // A well-formed response must carry at least one choice; otherwise the body
+    // is malformed and we surface a typed error instead of an empty success.
+    if resp["choices"].as_array().map_or(true, |c| c.is_empty()) {
+        return Err(MangabaError::LLM(format!("malformed OpenAI response: {resp}")).into());
+    }
     let choice = &resp["choices"][0];
     let message = &choice["message"];
     let content = message["content"].as_str().map(|s| s.to_string());
@@ -599,6 +666,9 @@ fn messages_to_google(messages: &[Message]) -> Vec<Value> {
 }
 
 fn parse_google_response(resp: Value, model: &str) -> Result<LLMResponse> {
+    if resp["candidates"].as_array().map_or(true, |c| c.is_empty()) {
+        return Err(MangabaError::LLM(format!("malformed Gemini response: {resp}")).into());
+    }
     let candidate = &resp["candidates"][0];
     let parts = &candidate["content"]["parts"];
     let mut content = None;
@@ -685,6 +755,9 @@ fn messages_to_claude(messages: &[Message]) -> Vec<Value> {
 }
 
 fn parse_claude_response(resp: Value, model: &str) -> Result<LLMResponse> {
+    if resp["content"].as_array().map_or(true, |c| c.is_empty()) {
+        return Err(MangabaError::LLM(format!("malformed Claude response: {resp}")).into());
+    }
     let mut content = None;
     let mut tool_calls = Vec::new();
     for block in resp["content"].as_array().unwrap_or(&vec![]) {
@@ -802,4 +875,52 @@ fn parse_hf_response(resp: Value, model: &str) -> Result<LLMResponse> {
         finish_reason,
         raw: Some(resp),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_event_concatenates_deltas() {
+        let block = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+        assert_eq!(parse_sse_event(block).as_deref(), Some("Hel"));
+        assert_eq!(parse_sse_event("data: [DONE]\n\n"), None);
+        assert_eq!(parse_sse_event(": comment only\n\n"), None);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_buffers_events_split_across_chunks() {
+        // A single SSE event is deliberately split across three byte chunks,
+        // mimicking TCP fragmentation. The buffer must reassemble it.
+        let chunks: Vec<reqwest::Result<Vec<u8>>> = vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"".to_vec()),
+            Ok(b"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"con".to_vec()),
+            Ok(b"tent\":\" world\"}}]}\n\ndata: [DONE]\n\n".to_vec()),
+        ];
+        let src = futures::stream::iter(chunks);
+        let collected: String = openai_sse_stream(src)
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(collected, "Hello world");
+    }
+
+    #[test]
+    fn parse_openai_response_rejects_empty_choices() {
+        let body = json!({ "choices": [] });
+        assert!(parse_openai_response(body, "m").is_err());
+    }
+
+    #[test]
+    fn parse_openai_response_accepts_valid_body() {
+        let body = json!({
+            "choices": [{ "message": { "content": "hi" }, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        });
+        let resp = parse_openai_response(body, "m").unwrap();
+        assert_eq!(resp.text(), "hi");
+        assert_eq!(resp.usage.total_tokens, 3);
+    }
 }

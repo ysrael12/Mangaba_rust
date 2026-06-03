@@ -91,7 +91,14 @@ O fluxo de execução:
 5. Aplica guardrails na resposta
 6. Executa output parser (se configurado)
 7. Salva na memória
-8. Retorna resultado ou faz retry em caso de erro
+8. Retorna o resultado; em caso de erro, reexecuta o ReAct até
+   `max_retry_on_error` vezes
+
+Se todas as tentativas falharem, `execute_task` **propaga o erro subjacente**
+(rede, rate limit, parse, etc.) com o contexto `"Agent '<role>' failed after N
+attempt(s)"` — a causa real é preservada na cadeia de erros do `anyhow`, não
+mascarada. Veja [errors-retry](errors-retry.md) para inspecionar a cadeia via
+`err.chain()`.
 
 ## ReAct Engine
 

@@ -73,7 +73,25 @@ impl MangabaError {
 }
 ```
 
-Atualmente apenas `RateLimit` é considerado retryable.
+Dentre as variantes de `MangabaError`, apenas `RateLimit` é retryable — erros de
+autenticação, validação e parsing de JSON são **fatais** e não devem ser
+retentados. Essa classificação é efetivamente consumida pelo `with_retry` (ver
+"Classificação de Erros" abaixo), garantindo que o agente falhe rápido em erros
+não-recuperáveis em vez de gastar todo o orçamento de retry com latência inútil.
+
+### Mapeamento de erros HTTP → MangabaError
+
+As chamadas de rede dos provedores LLM passam pelo helper interno
+`send_and_parse`, que traduz o status HTTP para a taxonomia tipada **na origem**,
+para que o `with_retry` decida corretamente:
+
+| Condição                        | Variante                    | Retryable? |
+|---------------------------------|-----------------------------|------------|
+| `429 Too Many Requests`         | `RateLimit { retry_after }` | ✅ (respeita `Retry-After`) |
+| `401` / `403`                   | `Authentication`            | ❌ |
+| Outros `4xx` / `5xx`            | `LLM`                       | ❌ |
+| `200` com payload `{"error":…}` | `LLM`                       | ❌ |
+| Falha de transporte (`reqwest`) | erro `anyhow` não tipado    | ✅ (tratado como transiente) |
 
 ### Conversão para anyhow
 
@@ -110,7 +128,35 @@ let result = with_retry(&config, "source_id", "operation_name", || async {
 }).await?;
 ```
 
+### Classificação de Erros
+
+Antes de cada retry, `with_retry` classifica o erro retornado e decide o que
+fazer — em vez de retentar tudo cegamente:
+
+```rust
+fn classify(err: &anyhow::Error) -> (bool /* retryable */, Option<u64> /* wait_ms */) {
+    match err.downcast_ref::<MangabaError>() {
+        // Rate limit: retenta, mas honra o atraso pedido pelo servidor.
+        Some(MangabaError::RateLimit { retry_after, .. }) => (true, Some(retry_after * 1000)),
+        // Demais MangabaError: só retenta se is_retryable() (auth/parse falham rápido).
+        Some(other) => (other.is_retryable(), None),
+        // Erros não tipados (rede/timeout do reqwest): tratados como transientes.
+        None => (true, None),
+    }
+}
+```
+
+Consequências práticas:
+
+- **Erro fatal** (auth, validação, parse) → retorna na **1ª tentativa**, sem
+  desperdiçar o orçamento de retry.
+- **`RateLimit`** → respeita o `Retry-After` do provedor em vez do backoff local,
+  evitando agravar o rate limiting.
+- **Erro transiente** (rede) → retentado com backoff exponencial + jitter.
+
 ### Algoritmo de Backoff
+
+Para erros transientes (sem `retry_after` forçado):
 
 ```
 backoff = min(initial * 2^(attempt-1), max_backoff)
@@ -122,6 +168,9 @@ Exemplo com config default:
 - Tentativa 1: ~1000ms (±250ms)
 - Tentativa 2: ~2000ms (±500ms)
 - Tentativa 3: ~4000ms (±1000ms)
+
+> Para `RateLimit`, o atraso é exatamente `retry_after * 1000ms` (o backoff
+> exponencial é ignorado).
 
 ### Eventos de Retry
 
@@ -180,24 +229,38 @@ let mut agent = Agent::new(
 match agent.execute_task("Do something", None).await {
     Ok(result) => println!("Sucesso: {result}"),
     Err(e) => {
-        // Tenta novamente após max_retry_on_error tentativas
-        eprintln!("Falha após retries: {e}");
+        // O erro preserva a CAUSA real encadeada via `.context(...)`.
+        eprintln!("Falha: {e}");
+        for cause in e.chain().skip(1) {
+            eprintln!("  causado por: {cause}");
+        }
     }
 }
 ```
 
-O agent emite eventos `AgentError` quando todas as tentativas falham.
+`execute_task` reexecuta o ReAct até `max_retry_on_error` vezes. Ao esgotar as
+tentativas, **propaga o erro subjacente** (rede, rate limit, parse, etc.)
+anexando o contexto `"Agent '<role>' failed after N attempt(s)"`, em vez de
+mascará-lo com uma mensagem genérica. O agent também emite `AgentError` quando
+todas as tentativas falham.
 
 ## Boas Práticas
 
-1. **Use `anyhow` para erros de aplicação**: a crate usa `anyhow::Result`
-   em todas as APIs públicas
+1. **Use `anyhow` para erros de aplicação**: a crate usa `anyhow::Result` em
+   todas as APIs públicas. Quando precisar reagir a um erro específico, recupere
+   a variante tipada com `err.downcast_ref::<MangabaError>()` — é exatamente o
+   que o `with_retry` faz.
 
-2. **Converta `MangabaError` para `anyhow`** via `.to_anyhow()` ou
-   `anyhow::Error::msg(e.to_string())`
+2. **Converta `MangabaError` para `anyhow`** via `.into()` (a blanket `From` do
+   `anyhow` aceita qualquer `std::error::Error`) ou `.to_anyhow()`. Preferir
+   `.into()` preserva a variante para downcast posterior.
 
-3. **Configure `max_retries` adequadamente**: muitas tentativas podem
-   mascarar problemas reais; poucas podem causar falhas em picos de taxa
+3. **Deixe os erros fatais falharem rápido**: não aumente `max_retries` para
+   "forçar" sucesso — erros de auth/parse são não-retryable por design e
+   retentá-los só adiciona latência.
 
-4. **Monitore eventos de retry**: o `EventBus` permite logar e alertar
-   sobre retries frequentes (possível indicação de rate limiting)
+4. **Configure `max_retries` adequadamente**: muitas tentativas podem mascarar
+   problemas reais; poucas podem causar falhas em picos de taxa.
+
+5. **Monitore eventos de retry**: o `EventBus` permite logar e alertar sobre
+   retries frequentes (possível indicação de rate limiting).

@@ -100,7 +100,7 @@ impl Crew {
             task.state.status = TaskStatus::Completed;
 
             if let Some(ref path) = task.config.output_file {
-                if let Err(e) = std::fs::write(path, &result) {
+                if let Err(e) = tokio::fs::write(path, &result).await {
                     log::warn!("Failed to write task output to {}: {}", path, e);
                 }
             }

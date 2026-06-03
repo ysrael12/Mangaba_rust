@@ -54,9 +54,9 @@ impl Task {
         let agent = self.agent.as_mut().ok_or_else(|| anyhow::anyhow!("Task has no agent assigned"))?;
         let result = agent.execute_task(&self.config.description, Some(&context)).await?;
 
-        // Write to output file if configured
+        // Write to output file if configured (non-blocking I/O on the executor)
         if let Some(ref path) = self.config.output_file {
-            if let Err(e) = std::fs::write(path, &result) {
+            if let Err(e) = tokio::fs::write(path, &result).await {
                 log::warn!("Failed to write task output to {}: {}", path, e);
             }
         }
@@ -79,16 +79,28 @@ impl Task {
         Ok(output)
     }
 
-    fn task_id(&self) -> String {
-        self.state.task_id.clone()
+    fn task_id(&self) -> &str {
+        &self.state.task_id
     }
 
     async fn build_context(&self) -> String {
         let mut parts = Vec::new();
 
-        // Gather outputs from context tasks
+        // Gather outputs from context tasks.
+        //
+        // We use `try_lock` rather than `lock().await` deliberately: a `Task`
+        // that (directly or transitively) lists itself in `context_tasks` would
+        // otherwise re-enter its own `tokio::Mutex` and deadlock forever. If the
+        // lock is already held, we skip that context with a warning instead of
+        // hanging the executor — in the normal sequential path the lock is free.
         for ctx_task in &self.context_tasks {
-            let task = ctx_task.lock().await;
+            let task = match ctx_task.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    log::warn!("Skipping context task: already locked (possible self-reference)");
+                    continue;
+                }
+            };
             if let Some(ref output) = task.state.output {
                 if output.success {
                     parts.push(format!(

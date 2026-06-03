@@ -111,9 +111,30 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-**OpenAI / OpenRouter**: SSE real via `bytes_stream()` + `parse_sse_chunk()`.
+**OpenAI / OpenRouter**: SSE real via `bytes_stream()` processado por
+`openai_sse_stream()`, que **acumula um buffer entre chunks** e só emite quando
+um evento SSE completo (`data: …\n\n`) é montado. Isso garante que um evento
+partido entre dois pacotes TCP — ou um code point UTF-8 cortado na fronteira do
+chunk — nunca seja descartado. Cada evento completo é decodificado por
+`parse_sse_event()`, que concatena todos os fragmentos `delta.content`.
 
 **Outros provedores**: default implementation — resposta completa em um chunk.
+
+## Tratamento de Erros nas Chamadas
+
+Todas as chamadas `chat()` passam pelo helper interno `send_and_parse`, que
+falha de forma tipada em vez de devolver uma resposta vazia silenciosa:
+
+- status HTTP é mapeado para `MangabaError` (`429 → RateLimit`, `401/403 →
+  Authentication`, demais → `LLM`) — ver [errors-retry](errors-retry.md);
+- respostas `200` que carregam um objeto `{"error": …}` viram `MangabaError::LLM`;
+- os parsers (`parse_openai_response`, `parse_google_response`,
+  `parse_claude_response`) retornam `Err` quando o corpo vem **sem**
+  `choices` / `candidates` / `content`, em vez de produzir `content: None`.
+
+Combinado com a classificação de erros do `with_retry`, isso faz com que um JSON
+malformado ou um erro de autenticação interrompa o loop imediatamente, ao invés
+de o agente girar até `max_iterations` com observações vazias.
 
 ## RetryLLMClient
 

@@ -162,7 +162,14 @@ impl Agent {
 
         self.state.status = AgentStatus::Error;
         EventBus::emit(Event::new(EventType::AgentError, &self.state.agent_id, serde_json::json!({"error": format!("{:?}", last_err)})));
-        Err(anyhow::anyhow!("Task failed after retries"))
+        // Preserve the underlying cause instead of swallowing it — the caller
+        // (and the retry/observability layers) need the real error to react.
+        match last_err {
+            Some(e) => Err(e.context(format!(
+                "Agent '{}' failed after {} attempt(s)", self.role, self.max_retry_on_error
+            ))),
+            None => Err(anyhow::anyhow!("Agent '{}' produced no result", self.role)),
+        }
     }
 
     pub fn add_peer(&mut self, peer: Agent) {
