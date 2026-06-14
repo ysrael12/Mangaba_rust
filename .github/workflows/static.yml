@@ -28,10 +28,12 @@ jobs:
         working-directory: ./Developer_documentation/mangaba
 
       - name: Criar index.html de redirect
-        working-directory: ./Developer_documentation/mangaba
         run: |
-          CRATE=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['name'].replace('-','_'))")
-          echo "<meta http-equiv=\"refresh\" content=\"0; url=${CRATE}/index.html\">" > target/doc/index.html
+          CRATE=$(cd ./Developer_documentation/mangaba && cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['name'].replace('-','_'))")
+          echo "Crate detectado: $CRATE"
+          echo "<meta http-equiv=\"refresh\" content=\"0; url=${CRATE}/index.html\">" \
+            > ./Developer_documentation/mangaba/target/doc/index.html
 
       - name: Corrigir permissões
         run: chmod -R +rX ./Developer_documentation/mangaba/target/doc
