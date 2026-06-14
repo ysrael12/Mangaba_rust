@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v4.2.2
 
       - name: Desabilitar Jekyll
-        run: touch ./Developer_documentation/mangaba/target/doc/.nojekyll
+        run: touch ./Developer_documentation/mangaba/.nojekyll
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -37,7 +37,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './Developer_documentation/mangaba/target/doc'
+          path: './Developer_documentation/mangaba'
 
       - name: Deploy to GitHub Pages
         id: deployment
