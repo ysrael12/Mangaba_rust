@@ -37,7 +37,7 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           # Upload entire repository
-          path: 'Developer_documentation/mangaba'
+          path: './Developer_documentation/mangaba'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
