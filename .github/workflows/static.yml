@@ -33,7 +33,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./Developer_documentation/mangaba/target/doc
+          path: './Developer_documentation/mangaba/target/doc'
 
       - name: Deploy to GitHub Pages
         id: deployment
