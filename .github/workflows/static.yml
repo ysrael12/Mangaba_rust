@@ -14,6 +14,9 @@ concurrency:
   group: "pages"
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   deploy:
     environment:
@@ -32,7 +35,6 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
-
         with:
           path: './Developer_documentation/mangaba/target/doc'
 
