@@ -27,8 +27,8 @@ jobs:
       - name: Desabilitar Jekyll
         run: touch ./Developer_documentation/mangaba/target/doc/.nojekyll
 
-      - name: Corrigir permissões
-        run: chmod -R +rX ./Developer_documentation/mangaba/target/doc
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
