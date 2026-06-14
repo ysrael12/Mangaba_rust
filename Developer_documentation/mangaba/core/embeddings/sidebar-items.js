@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["cosine_similarity"],"mod":["cache","huggingface","openai","store"],"struct":["NoOpEmbedding"],"trait":["Embedding"]};

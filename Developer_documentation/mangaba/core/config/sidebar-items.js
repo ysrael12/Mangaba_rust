@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SUPPORTED_PROVIDERS"],"fn":["create_llm_config","default_model","default_temperature","detect_provider","ensure_env_loaded","env","normalize_provider","provider_env_keys"],"static":["LOAD_ENV"],"struct":["Config"]};

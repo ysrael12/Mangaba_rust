@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["LocalChroma","LocalCollection","LocalEntry","LocalQueryResult"]};
