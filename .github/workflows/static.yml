@@ -35,6 +35,9 @@ jobs:
           echo "<meta http-equiv=\"refresh\" content=\"0; url=${CRATE}/index.html\">" \
             > ./Developer_documentation/mangaba/target/doc/index.html
 
+      - name: Desabilitar Jekyll
+        run: touch ./Developer_documentation/mangaba/target/doc/.nojekyll
+
       - name: Corrigir permissões
         run: chmod -R +rX ./Developer_documentation/mangaba/target/doc
 
