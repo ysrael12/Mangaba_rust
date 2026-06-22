@@ -1,5 +1,5 @@
 # Mangaba AI
-
+https://ysrael12.github.io/Mangaba_rust/mangaba/
 Port of Mangaba AI from Python to Rust — a modular, provider-agnostic LLM agent framework.
 
 ```
